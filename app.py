@@ -43,6 +43,7 @@ assessment_mode = st.selectbox(
     [
         "PPE compliance",
         "Fire and smoke detection",
+        "Restricted-area entry detection",
     ],
 )
 
@@ -55,7 +56,7 @@ if assessment_mode == "PPE compliance":
             "Workers must wear both safety helmets and high-visibility vests.",
         ],
     )
-else:
+elif assessment_mode == "Fire and smoke detection":
     rule = st.selectbox(
         "Hazard to assess",
         [
@@ -63,6 +64,13 @@ else:
             "Detect fire only",
             "Detect smoke only",
         ],
+    )
+
+else:
+    rule = "Detect entry into an area marked RESTRICTED AREA."
+    st.info(
+        "The model will assess visible entry into a sign-marked "
+        "restricted area. It cannot determine authorization status."
     )
 
 interval = st.select_slider(
@@ -100,7 +108,6 @@ def timestamp_text(seconds):
     return f"{hours:02}:{minutes:02}:{secs:02}"
 
 
-
 def assess_frame(
     client,
     image_bytes,
@@ -111,7 +118,52 @@ def assess_frame(
 ):
     """Assess PPE compliance or fire/smoke hazards in a video frame."""
 
-    if safety_rule.startswith("Detect"):
+    if safety_rule.startswith("Detect entry into an area"):
+        prompt = f"""
+You are a cautious CCTV safety auditor.
+
+CURRENT TIMESTAMP: {timestamp}
+RULE: {safety_rule}
+
+You receive the current CCTV frame and, if available, the previous
+sampled frame from the same video.
+
+Assess only visible evidence of a person entering an area marked by
+a sign that clearly reads "RESTRICTED AREA".
+
+Look for:
+- A visible sign reading "RESTRICTED AREA".
+- The area that the sign appears to refer to.
+- A person visibly crossing into that area.
+- Previous-frame context, if available, to help determine whether
+  the person moved from outside to inside the indicated area.
+
+DECISIONS:
+- ENTRY_OBSERVED: A person is visibly entering or has clearly crossed
+  into the sign-marked area, supported by the available frame evidence.
+- NO_ENTRY_OBSERVED: The sign and relevant area are sufficiently visible,
+  but no entry is observed in the current evidence.
+- UNCERTAIN: The sign, relevant area, person's movement, or boundary
+  cannot be determined reliably.
+
+IMPORTANT:
+- Do not infer authorization status from clothing, appearance, or PPE.
+- Do not assume a person is unauthorized merely because they lack PPE.
+- Do not claim entry if the person is only standing near the sign.
+- If the sign or the relevant area is unclear, use UNCERTAIN.
+- A single frame may not establish whether entry occurred. Use the
+  previous frame as context when available.
+- Describe only what is visible.
+
+Return only valid JSON with exactly these fields:
+{{
+  "decision": "ENTRY_OBSERVED, NO_ENTRY_OBSERVED, or UNCERTAIN",
+  "evidence": "Describe the visible sign, person, and observed movement",
+  "reasoning": "Explain the decision using visible evidence",
+  "recommended_action": "Suggest proportionate human verification"
+}}
+"""
+    elif safety_rule.startswith("Detect"):
         if safety_rule == "Detect fire and smoke":
             hazard_scope = "Assess both fire and smoke."
         elif safety_rule == "Detect fire only":
@@ -252,6 +304,25 @@ also meets the head visibility requirements. This field is a model judgment.
     recommended_action = str(
         result.get("recommended_action", "Review this frame manually.")
     )
+
+    if safety_rule.startswith("Detect entry into an area"):
+        allowed = {
+            "ENTRY_OBSERVED",
+            "NO_ENTRY_OBSERVED",
+            "UNCERTAIN",
+        }
+        decision = str(result.get("decision", "UNCERTAIN")).upper().strip()
+
+        if decision not in allowed:
+            decision = "UNCERTAIN"
+
+        return {
+            "decision": decision,
+            "head_fully_visible": None,
+            "evidence": evidence,
+            "reasoning": reasoning,
+            "recommended_action": recommended_action,
+        }
 
     if safety_rule.startswith("Detect"):
         allowed = {"FIRE", "SMOKE", "BOTH", "NO_HAZARD", "UNCERTAIN"}
@@ -441,10 +512,30 @@ if "video_results" in st.session_state:
     st.divider()
     st.subheader("3. Assessment report")
 
-    
     current_rule = st.session_state["video_rule"]
 
-    if current_rule.startswith("Detect"):
+    if current_rule.startswith("Detect entry into an area"):
+        entry_observed = sum(
+            item["decision"] == "ENTRY_OBSERVED" for item in results
+        )
+        no_entry = sum(
+            item["decision"] == "NO_ENTRY_OBSERVED" for item in results
+        )
+        uncertain = sum(
+            item["decision"] == "UNCERTAIN" for item in results
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Entry observed", entry_observed)
+        col2.metric("No entry observed", no_entry)
+        col3.metric("Uncertain frames", uncertain)
+
+        st.caption(
+            "Counts represent sampled frames, not unique events. "
+            "Entry alerts require human verification."
+        )
+
+    elif current_rule.startswith("Detect"):
         fire_alerts = sum(
             item["decision"] in {"FIRE", "BOTH"} for item in results
         )
@@ -506,14 +597,19 @@ if "video_results" in st.session_state:
                 if item.get("error"):
                     st.warning(f"Technical error: {item['error']}")
 
-    
     report = [
         {
             "timestamp": item["timestamp"],
             "assessment_mode": (
-                "Fire and smoke detection"
-                if st.session_state["video_rule"].startswith("Detect")
-                else "PPE compliance"
+                "Restricted-area entry detection"
+                if st.session_state["video_rule"].startswith(
+                    "Detect entry into an area"
+                )
+                else (
+                    "Fire and smoke detection"
+                    if st.session_state["video_rule"].startswith("Detect")
+                    else "PPE compliance"
+                )
             ),
             "decision": item["decision"],
             "head_fully_visible": item.get("head_fully_visible"),
@@ -526,12 +622,14 @@ if "video_results" in st.session_state:
         for item in results
     ]
 
-    is_hazard_mode = st.session_state["video_rule"].startswith("Detect")
-    report_filename = (
-        "fire_smoke_assessment_report.json"
-        if is_hazard_mode
-        else "ppe_compliance_report.json"
-    )
+    current_rule = st.session_state["video_rule"]
+
+    if current_rule.startswith("Detect entry into an area"):
+        report_filename = "restricted_area_entry_report.json"
+    elif current_rule.startswith("Detect"):
+        report_filename = "fire_smoke_assessment_report.json"
+    else:
+        report_filename = "ppe_compliance_report.json"
 
     st.download_button(
         "Download JSON report",
@@ -540,8 +638,6 @@ if "video_results" in st.session_state:
         mime="application/json",
     )
 
-    
-    
     st.info(
         "Review flagged and uncertain frames manually. This prototype does not "
         "guarantee detection of every violation. Previous-frame comparison adds "
