@@ -2,6 +2,13 @@
 
 A vision-language-model-based prototype for assessing construction-site safety compliance from video footage. It uses Google's Gemini vision model to assess sampled video frames without YOLO or a separate object-detection model.
 
+## Demo
+
+The application analyses construction-site video footage and generates timestamped safety assessments with visual evidence and recommended actions.
+
+![VLM Safety Assessment Demo](screenshots/demo.png)
+
+
 ## Features
 
 - Upload construction-site videos for safety assessment
