@@ -37,14 +37,33 @@ if not API_KEY:
     st.stop()
 
 st.subheader("1. Configure the assessment")
-rule = st.selectbox(
-    "Safety rule",
+
+assessment_mode = st.selectbox(
+    "Assessment type",
     [
-        "Workers must wear protective safety helmets.",
-        "Workers must wear high-visibility safety vests.",
-        "Workers must wear both safety helmets and high-visibility vests.",
+        "PPE compliance",
+        "Fire and smoke detection",
     ],
 )
+
+if assessment_mode == "PPE compliance":
+    rule = st.selectbox(
+        "Safety rule",
+        [
+            "Workers must wear protective safety helmets.",
+            "Workers must wear high-visibility safety vests.",
+            "Workers must wear both safety helmets and high-visibility vests.",
+        ],
+    )
+else:
+    rule = st.selectbox(
+        "Hazard to assess",
+        [
+            "Detect fire and smoke",
+            "Detect fire only",
+            "Detect smoke only",
+        ],
+    )
 
 interval = st.select_slider(
     "Sample one frame every",
@@ -81,6 +100,7 @@ def timestamp_text(seconds):
     return f"{hours:02}:{minutes:02}:{secs:02}"
 
 
+
 def assess_frame(
     client,
     image_bytes,
@@ -89,8 +109,58 @@ def assess_frame(
     previous_image_bytes=None,
     previous_timestamp=None,
 ):
-    """Assess the current frame, optionally comparing it with the prior sample."""
-    prompt = f"""
+    """Assess PPE compliance or fire/smoke hazards in a video frame."""
+
+    if safety_rule.startswith("Detect"):
+        if safety_rule == "Detect fire and smoke":
+            hazard_scope = "Assess both fire and smoke."
+        elif safety_rule == "Detect fire only":
+            hazard_scope = "Assess fire only. Do not report smoke alone as a hazard."
+        else:
+            hazard_scope = "Assess smoke only. Do not report fire alone as a hazard."
+
+        prompt = f"""
+You are a cautious construction-site fire and smoke safety auditor.
+
+ASSESSMENT SCOPE: {hazard_scope}
+CURRENT TIMESTAMP: {timestamp}
+
+You receive the current video frame and, if available, the previous
+sampled frame from the same video. Use the previous frame only as context.
+Base the current decision on visible evidence in the current frame.
+
+DEFINITIONS:
+- FIRE: Visible flames or a clearly identifiable active fire.
+- SMOKE: A visible smoke plume or smoke-like emission. Do not automatically
+  label dust, steam, fog, clouds, or ordinary exhaust as smoke.
+- NO_HAZARD: No visible evidence of the selected hazard in this frame.
+- UNCERTAIN: The image is ambiguous, obscured, blurry, or insufficient
+  to make a reliable decision.
+
+RULES:
+- Do not infer a fire from orange lighting, sparks, or hot-looking objects alone.
+- Do not infer smoke from dust, steam, fog, clouds, or exhaust without
+  sufficient visual evidence.
+- Do not invent the source, cause, location, or severity of a hazard.
+- If a hazard is only suspected, classify it as UNCERTAIN.
+- If both fire and smoke are clearly visible and both are in scope, report BOTH.
+- Describe only what is actually visible.
+- A sampled frame cannot establish that no hazard exists in the full video.
+
+Return only valid JSON with exactly these fields:
+{{
+  "decision": "FIRE, SMOKE, BOTH, NO_HAZARD, or UNCERTAIN",
+  "evidence": "Specific visible evidence in the frame",
+  "reasoning": "Brief explanation of the decision",
+  "recommended_action": "Proportionate safety action"
+}}
+
+If the selected scope is fire only, return FIRE, NO_HAZARD, or UNCERTAIN.
+If the selected scope is smoke only, return SMOKE, NO_HAZARD, or UNCERTAIN.
+For ambiguous evidence, prefer UNCERTAIN rather than guessing.
+"""
+    else:
+        prompt = f"""
 You are a cautious construction-site safety auditor analysing video frames.
 
 SAFETY RULE: {safety_rule}
@@ -151,6 +221,7 @@ also meets the head visibility requirements. This field is a model judgment.
 """
 
     contents = [prompt]
+
     if previous_image_bytes is not None:
         contents.extend(
             [
@@ -161,6 +232,7 @@ also meets the head visibility requirements. This field is a model judgment.
                 ),
             ]
         )
+
     contents.extend(
         [
             f"CURRENT FRAME at {timestamp}:",
@@ -175,15 +247,40 @@ also meets the head visibility requirements. This field is a model judgment.
     )
     result = json.loads(response.text or "{}")
 
+    evidence = str(result.get("evidence", "No evidence supplied."))
+    reasoning = str(result.get("reasoning", ""))
+    recommended_action = str(
+        result.get("recommended_action", "Review this frame manually.")
+    )
+
+    if safety_rule.startswith("Detect"):
+        allowed = {"FIRE", "SMOKE", "BOTH", "NO_HAZARD", "UNCERTAIN"}
+        decision = str(result.get("decision", "UNCERTAIN")).upper().strip()
+
+        if decision not in allowed:
+            decision = "UNCERTAIN"
+
+        if safety_rule == "Detect fire only" and decision in {"SMOKE", "BOTH"}:
+            decision = "UNCERTAIN"
+        elif safety_rule == "Detect smoke only" and decision in {"FIRE", "BOTH"}:
+            decision = "UNCERTAIN"
+
+        return {
+            "decision": decision,
+            "head_fully_visible": None,
+            "evidence": evidence,
+            "reasoning": reasoning,
+            "recommended_action": recommended_action,
+        }
+
     allowed = {"VIOLATION", "COMPLIANT", "UNCERTAIN"}
     decision = str(result.get("decision", "UNCERTAIN")).upper().strip()
     head_fully_visible = result.get("head_fully_visible")
+
     if decision not in allowed:
         decision = "UNCERTAIN"
 
-    # Safety gate: do not accept a violation unless the model explicitly
-    # reports the relevant head is fully visible. This is not independent
-    # verification; the visibility judgment still comes from the VLM.
+    # A violation requires an explicit positive visibility judgment.
     if (
         "helmet" in safety_rule.lower()
         and decision == "VIOLATION"
@@ -194,12 +291,11 @@ also meets the head visibility requirements. This field is a model judgment.
     return {
         "decision": decision,
         "head_fully_visible": head_fully_visible,
-        "evidence": str(result.get("evidence", "No evidence supplied.")),
-        "reasoning": str(result.get("reasoning", "")),
-        "recommended_action": str(
-            result.get("recommended_action", "Review this frame manually.")
-        ),
+        "evidence": evidence,
+        "reasoning": reasoning,
+        "recommended_action": recommended_action,
     }
+
 
 
 if uploaded_video is not None and st.button("Analyse Video", type="primary"):
@@ -345,15 +441,53 @@ if "video_results" in st.session_state:
     st.divider()
     st.subheader("3. Assessment report")
 
-    violations = sum(item["decision"] == "VIOLATION" for item in results)
-    compliant = sum(item["decision"] == "COMPLIANT" for item in results)
-    uncertain = sum(item["decision"] == "UNCERTAIN" for item in results)
+    
+    current_rule = st.session_state["video_rule"]
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Potential violations", violations)
-    col2.metric("Compliant frames", compliant)
-    col3.metric("Uncertain frames", uncertain)
-    st.caption("Counts represent sampled frames, not unique violations or people.")
+    if current_rule.startswith("Detect"):
+        fire_alerts = sum(
+            item["decision"] in {"FIRE", "BOTH"} for item in results
+        )
+        smoke_alerts = sum(
+            item["decision"] in {"SMOKE", "BOTH"} for item in results
+        )
+        no_hazard = sum(
+            item["decision"] == "NO_HAZARD" for item in results
+        )
+        uncertain = sum(
+            item["decision"] == "UNCERTAIN" for item in results
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Fire alert frames", fire_alerts)
+        col2.metric("Smoke alert frames", smoke_alerts)
+        col3.metric("No hazard detected", no_hazard)
+        col4.metric("Uncertain frames", uncertain)
+
+        st.caption(
+            "Counts represent sampled frames, not unique incidents. "
+            "Alerts require human verification."
+        )
+    else:
+        violations = sum(
+            item["decision"] == "VIOLATION" for item in results
+        )
+        compliant = sum(
+            item["decision"] == "COMPLIANT" for item in results
+        )
+        uncertain = sum(
+            item["decision"] == "UNCERTAIN" for item in results
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Potential violations", violations)
+        col2.metric("Compliant frames", compliant)
+        col3.metric("Uncertain frames", uncertain)
+
+        st.caption(
+            "Counts represent sampled frames, not unique violations or people."
+        )
+
 
     for item in results:
         with st.expander(
@@ -372,9 +506,15 @@ if "video_results" in st.session_state:
                 if item.get("error"):
                     st.warning(f"Technical error: {item['error']}")
 
+    
     report = [
         {
             "timestamp": item["timestamp"],
+            "assessment_mode": (
+                "Fire and smoke detection"
+                if st.session_state["video_rule"].startswith("Detect")
+                else "PPE compliance"
+            ),
             "decision": item["decision"],
             "head_fully_visible": item.get("head_fully_visible"),
             "rule": st.session_state["video_rule"],
@@ -385,12 +525,23 @@ if "video_results" in st.session_state:
         }
         for item in results
     ]
+
+    is_hazard_mode = st.session_state["video_rule"].startswith("Detect")
+    report_filename = (
+        "fire_smoke_assessment_report.json"
+        if is_hazard_mode
+        else "ppe_compliance_report.json"
+    )
+
     st.download_button(
         "Download JSON report",
         data=json.dumps(report, indent=2),
-        file_name="video_safety_report.json",
+        file_name=report_filename,
         mime="application/json",
     )
+
+    
+    
     st.info(
         "Review flagged and uncertain frames manually. This prototype does not "
         "guarantee detection of every violation. Previous-frame comparison adds "
